@@ -1,8 +1,10 @@
 services:
   - type: web
-    name: news-rewriter-api
+    name: ai-article-generator
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
-    envVars: []
-    pythonVersion: 3.10.13
+    envVars:
+      - key: OPENAI_API_KEY
+        fromDatabase: false
