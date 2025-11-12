@@ -1,3 +1,10 @@
+import sys, types
+if 'cgi' not in sys.modules:
+    sys.modules['cgi'] = types.SimpleNamespace(
+        escape=lambda s, quote=True: s
+    )
+
+
 from flask import Flask, jsonify
 import feedparser
 import requests
@@ -76,3 +83,4 @@ def latest_news():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
