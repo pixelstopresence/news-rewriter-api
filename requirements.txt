@@ -1,22 +1,18 @@
-# PyTorch CPU-only installation (add this line first for wheel index)
---index-url https://download.pytorch.org/whl/cpu
-
-# Core PyTorch deps (CPU versions)
-torch==2.5.0+cpu
-# torchvision==0.20.0+cpu  # Uncomment if using image processing
-
-# Flask and web deps
-Flask==3.0.0
-requests==2.31.0
-beautifulsoup4==4.12.2
+# Core Flask and web deps
+Flask==3.1.2
+requests==2.32.3
+beautifulsoup4==4.12.3
 
 # Scraping and RSS
 newspaper3k==0.2.8
 feedparser==6.0.11
 
-# AI/NLP deps (compatible with torch 2.5.0)
-transformers==4.35.0
-nltk==3.8.1
+# AI/NLP deps
+transformers==4.44.0
+nltk==3.8.2
 
-# Optional advanced SEO
-openai==1.3.0
+# Optional SEO
+openai==1.50.0
+
+# PyTorch CPU-only (install separately via build command)
+# torch==2.5.0+cpu handled in render.yml
