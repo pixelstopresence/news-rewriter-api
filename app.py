@@ -32,18 +32,24 @@ def fetch_article_from_site(url):
         return None
 
 def rewrite_content(content):
-    """Rewrite text using a free public Hugging Face model (no key)."""
-    payload = {"inputs": f"Rewrite this professionally in human-like, engaging 1000+ words:\n{content}"}
-    response = requests.post(
-        "https://api-inference.huggingface.co/models/facebook/bart-large-cnn",
-        json=payload,
-        timeout=30
-    )
+    """Rewrite text in a more natural, human-like style using T5 paraphraser."""
+    prompt = f"paraphrase: {content} </s>"
+    payload = {"inputs": prompt}
     try:
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/Vamsi/T5_Paraphrase_Paws",
+            json=payload,
+            timeout=60
+        )
         data = response.json()
-        return data[0]["summary_text"]
-    except Exception:
+        text = data[0]["generated_text"]
+        # Add simple punctuation fixes
+        text = text.replace(" .", ".").replace(" ,", ",")
+        return text
+    except Exception as e:
+        print("Rewrite error:", e)
         return content
+
 
 @app.route("/news/latest", methods=["GET"])
 def get_latest():
@@ -69,3 +75,4 @@ def get_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
