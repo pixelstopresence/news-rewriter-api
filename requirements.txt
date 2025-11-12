@@ -9,10 +9,10 @@ feedparser==6.0.11
 
 # AI/NLP deps
 transformers==4.44.0
-nltk==3.8.2
+nltk==3.9.2  # Latest stable: Fixes security issues, compatible with Python 3.11
 
-# Optional SEO
+# Production WSGI server
+gunicorn==22.0.0
+
+# Optional SEO (updated to latest)
 openai==1.50.0
-
-# PyTorch CPU-only (install separately via build command)
-# torch==2.5.0+cpu handled in render.yml
