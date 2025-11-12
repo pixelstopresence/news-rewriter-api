@@ -3,17 +3,23 @@ services:
     name: news-rewriter-api
     env: python
     buildCommand: |
+      # Step 1: Upgrade pip and tools
       pip install --upgrade pip setuptools wheel
+      
+      # Step 2: Install PyTorch CPU-only from official index
+      pip install torch==2.5.0+cpu torchvision==0.20.0+cpu --index-url https://download.pytorch.org/whl/cpu
+      
+      # Step 3: Install remaining deps from standard PyPI
       pip install -r requirements.txt
-    startCommand: python app.py
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT  # Use gunicorn for production
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9  # Stable for torch 2.5.0
+        value: 3.11.9
       - key: FLASK_ENV
         value: production
-      - key: OPENAI_API_KEY  # Optional
-        sync: false
-      - key: TORCH_INDEX_URL  # Reinforce CPU index if needed
-        value: https://download.pytorch.org/whl/cpu
-    plan: free  # Upgrade to Starter for faster builds (~10-15 mins with models)
-    region: singapore  # Low latency for India
+      - key: OPENAI_API_KEY
+        sync: false  # Set in dashboard if using
+      - key: PORT
+        value: 10000  # Render default
+    plan: free  # Upgrade to Starter for reliability
+    region: singapore
