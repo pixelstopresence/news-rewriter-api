@@ -1,212 +1,271 @@
-# app.py
-from flask import Flask, jsonify, request
-import os
-import openai
-import feedparser
+from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
+from newspaper import Article, ArticleException, build as newspaper_build
+import newspaper  # For source building
+import feedparser  # RSS fallback
+from transformers import pipeline, T5Tokenizer, T5ForConditionalGeneration
+import torch
+import nltk
+from nltk.tokenize import sent_tokenize
+from nltk.corpus import stopwords
+import re
+from openai import OpenAI  # Optional
+import os
+import time
+from datetime import datetime
 
 app = Flask(__name__)
-openai.api_key = os.environ.get("OPENAI_API_KEY")
 
-# Default sources (RSS feeds and example site homepages)
-DEFAULT_SOURCES = [
-    # RSS feeds (recommended)
-    "https://uxdesign.cc/feed",
-    "https://www.marketingaiinstitute.com/feed",
-    "https://www.smashingmagazine.com/feed/",
-    "https://www.creativebloq.com/feed",
-    "https://towardsdatascience.com/feed",
-    "https://medium.com/topic/artificial-intelligence/feed",
-    "https://medium.com/topic/design/feed",
-    # Example website homepages (will attempt to scrape article content)
-    "https://uxdesign.cc/",
-    "https://www.smashingmagazine.com/",
-    "https://www.creativebloq.com/"
-]
+# Initialize models (load once)
+device = 0 if torch.cuda.is_available() else -1
+summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=device)
+tokenizer = T5Tokenizer.from_pretrained("t5-small")
+expander = T5ForConditionalGeneration.from_pretrained("t5-small")
+nltk.download('punkt', quiet=True)
+nltk.download('stopwords', quiet=True)
+stop_words = set(stopwords.words('english'))
 
-TOPIC_KEYWORDS = ["ui/ux", "user interface", "ux design",
-                  "artificial intelligence", "ai",
-                  "digital marketing", "tech", "technology"]
-BLACKLIST_KEYWORDS = ["privacy policy", "terms & conditions",
-                      "services", "pricing", "about us", "why choose", "features"]
+# Optional OpenAI
+openai_client = None
+if os.getenv('OPENAI_API_KEY'):
+    openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-
-# --- helpers ---
-def looks_like_rss(url: str) -> bool:
-    return url.lower().endswith("/feed") or "rss" in url.lower()
-
-def is_blacklisted(text: str) -> bool:
-    lc = text.lower()
-    return any(kw in lc for kw in BLACKLIST_KEYWORDS)
-
-def fetch_full_article_from_url(url: str, min_len=300):
-    """Try to scrape the target URL and return main text (or None)."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, timeout=10, headers=headers)
-        if resp.status_code != 200:
-            return None
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # Try common article selectors first
-        selectors = [
-            {"name": "article"},
-            {"name": "div", "attrs": {"class": lambda v: v and "article" in v.lower()}},
-            {"name": "div", "attrs": {"class": lambda v: v and "post" in v.lower()}},
-            {"name": "main"}
-        ]
-        text_blocks = []
-        for sel in selectors:
-            found = soup.find_all(sel.get("name"), sel.get("attrs")) if sel.get("attrs") is not None else soup.find_all(sel.get("name"))
-            for f in found:
-                paragraphs = f.find_all("p")
-                if paragraphs:
-                    text = " ".join(p.get_text(strip=True) for p in paragraphs)
-                    if len(text) >= min_len and not is_blacklisted(text[:200]):
-                        return text
-        # fallback: gather all <p> on page
-        paragraphs = soup.find_all("p")
-        text = " ".join(p.get_text(strip=True) for p in paragraphs)
-        if len(text) >= min_len and not is_blacklisted(text[:200]):
-            return text
-        return None
-    except Exception as e:
-        print(f"[fetch_full_article_from_url] error for {url}: {e}")
-        return None
-
-
-def fetch_from_rss(feed_url: str, max_entries=5):
-    """Parse RSS and return list of (title, summary, link)."""
-    try:
-        feed = feedparser.parse(feed_url)
-        entries = []
-        for entry in feed.entries[:max_entries]:
-            title = getattr(entry, "title", "")
-            summary = getattr(entry, "summary", "")
-            link = getattr(entry, "link", "")
-            if is_blacklisted(title) or is_blacklisted(summary):
-                continue
-            entries.append({"title": title, "summary": summary, "link": link})
-        return entries
-    except Exception as e:
-        print(f"[fetch_from_rss] {feed_url} error: {e}")
-        return []
-
-
-# --- AI writer using gpt-3.5-turbo (low cost) ---
-def ai_generate_article_from_seed(seed_text: str, topic: str, min_words=1000):
-    """
-    Use GPT-3.5 to generate an original SEO-optimized article based on seed_text/topic.
-    Will not include links and should be > min_words.
-    """
-    # We give the model both the topic and a short seed (summary/full content) to preserve context,
-    # but we instruct it to produce an original article without source links.
-    system_msg = (
-        "You are a professional SEO content writer. "
-        "Given a topic and a short seed from an article, produce a completely original, "
-        "human-like, SEO-optimized article. Do NOT include any source links or mention original sources. "
-        "Make the content unique, engaging, and at least the requested length."
-    )
-    user_prompt = f"""
-Topic: {topic}
-
-Seed (short): {seed_text[:2000]}
-
-Instructions:
-- Produce an SEO-optimized title and article content.
-- Use headings, subheadings, bullet points where helpful.
-- Include practical examples and actionable tips.
-- Ensure the article reads like original human writing and is plagiarism-free.
-- Target length: at least {min_words} words.
-- Do not include source links or mention the original source.
-- Avoid copying sentences verbatim from the seed; rewrite and expand freely.
-"""
-    try:
-        # estimate tokens: 1000 words ≈ 1400+ tokens, set max_tokens accordingly (adjust per need)
-        resp = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.7,
-            max_tokens=2200  # increase if you want longer output (and cost)
-        )
-        text = resp.choices[0].message.content
-        return text
-    except Exception as e:
-        print(f"[ai_generate_article_from_seed] OpenAI error: {e}")
-        return None
-
-
-# --- Main endpoint ---
-@app.route("/generate", methods=["POST"])
-def generate():
-    """
-    POST JSON body:
-    {
-      "topic": "Your topic/title/keyword",
-      "sources": ["optional list of RSS feed urls or site urls"],   # optional
-      "max_articles": 1   # how many generated articles to return
+# Blog-focused websites configuration (add/remove as needed)
+WEBSITES = {
+    # UI/UX Design
+    'ux_collective': {
+        'name': 'UX Collective',
+        'url': 'https://uxdesign.cc',
+        'category': 'UI/UX',
+        'config': {'language': 'en', 'max_pages_to_fetch': 5}
+    },
+    'designlab': {
+        'name': 'Designlab Blog',
+        'url': 'https://designlab.com/blog',
+        'category': 'UI/UX',
+        'config': {'language': 'en', 'max_pages_to_fetch': 5}
+    },
+    'codrops': {
+        'name': 'Codrops',
+        'url': 'https://tympanus.net/codrops',
+        'category': 'UI/UX',
+        'config': {'language': 'en', 'max_pages_to_fetch': 5}
+    },
+    
+    # Digital Marketing
+    'hubspot': {
+        'name': 'HubSpot Blog',
+        'url': 'https://blog.hubspot.com',
+        'category': 'Digital Marketing',
+        'config': {'language': 'en', 'max_pages_to_fetch': 10}
+    },
+    'moz': {
+        'name': 'Moz Blog',
+        'url': 'https://moz.com/blog',
+        'category': 'Digital Marketing',
+        'config': {'language': 'en', 'max_pages_to_fetch': 5}
+    },
+    'ahrefs': {
+        'name': 'Ahrefs Blog',
+        'url': 'https://ahrefs.com/blog',
+        'category': 'Digital Marketing',
+        'config': {'language': 'en', 'max_pages_to_fetch': 5}
+    },
+    
+    # AI and Technologies
+    'marktechpost': {
+        'name': 'MarkTechPost',
+        'url': 'https://www.marktechpost.com',
+        'category': 'AI/Tech',
+        'config': {'language': 'en', 'max_pages_to_fetch': 10}
+    },
+    'huggingface': {
+        'name': 'Hugging Face Blog',
+        'url': 'https://huggingface.co/blog',
+        'category': 'AI/Tech',
+        'config': {'language': 'en', 'max_pages_to_fetch': 5}
     }
-    """
-    data = request.get_json(force=True)
-    topic = data.get("topic", "").strip()
-    if not topic:
-        return jsonify({"error": "Please provide a topic"}), 400
+}
 
-    sources = data.get("sources") or DEFAULT_SOURCES
-    max_articles = int(data.get("max_articles", 1))
+def scrape_article(url):
+    """Scrape single article with newspaper3k."""
+    try:
+        article = Article(url)
+        article.download()
+        article.parse()
+        return {
+            'title': article.title,
+            'text': article.text,
+            'authors': article.authors,
+            'publish_date': str(article.publish_date) if article.publish_date else 'Unknown',
+            'url': url
+        }
+    except ArticleException:
+        return None
 
-    generated = []
-    # iterate through sources, try RSS first if looks like rss
-    for src in sources:
-        if len(generated) >= max_articles:
-            break
+def fetch_rss_fallback(site_url):
+    """Fallback to RSS if scraping fails."""
+    try:
+        feed = feedparser.parse(site_url + '/rss')  # Common RSS path
+        if feed.entries:
+            entry = feed.entries[0]  # Latest
+            return {
+                'title': entry.title,
+                'url': entry.link,
+                'text_preview': (entry.summary or '')[:300],
+                'publish_date': entry.published if 'published' in entry else 'Unknown',
+                'authors': [entry.author] if 'author' in entry else []
+            }
+    except:
+        pass
+    return None
 
-        if looks_like_rss(src):
-            entries = fetch_from_rss(src, max_entries=5)
-            for e in entries:
-                if len(generated) >= max_articles:
+def fetch_latest_articles(site_key, num_articles=10):
+    """Fetch latest from site with RSS fallback."""
+    if site_key not in WEBSITES:
+        return []
+    
+    site = WEBSITES[site_key]
+    articles = []
+    
+    try:
+        # Primary: Newspaper3k build
+        source = newspaper_build(site['url'], 
+                                memoize_articles=False,
+                                language=site['config'].get('language', 'en'),
+                                max_pages_to_fetch=site['config'].get('max_pages_to_fetch', 3))
+        
+        for article_url in source.article_urls()[:num_articles]:
+            time.sleep(1)  # Rate limit
+            art_data = scrape_article(article_url)
+            if art_data and len(art_data['text']) > 200:
+                art_data['source'] = site['name']
+                art_data['category'] = site['category']
+                articles.append(art_data)
+                if len(articles) >= num_articles:
                     break
-                # Try to fetch full article from entry.link for richer seed
-                seed = None
-                if e.get("link"):
-                    seed = fetch_full_article_from_url(e["link"]) or e.get("summary") or e.get("title")
-                else:
-                    seed = e.get("summary") or e.get("title")
-                if not seed or is_blacklisted(seed[:200]):
-                    continue
-                article_text = ai_generate_article_from_seed(seed_text=seed, topic=topic)
-                if article_text:
-                    generated.append({
-                        "topic": topic,
-                        "generated_article": article_text
-                    })
+                    
+    except Exception:
+        # Fallback: RSS
+        fallback = fetch_rss_fallback(site['url'])
+        if fallback:
+            articles.append({**fallback, 'source': site['name'], 'category': site['category']})
+    
+    # Sort by date
+    articles.sort(key=lambda x: x.get('publish_date', ''), reverse=True)
+    return articles
+
+def fetch_top_viewed_or_latest(website_keys=None, num_per_site=5, by_views=False):
+    """Fetch across sites."""
+    if website_keys is None:
+        website_keys = list(WEBSITES.keys())
+    
+    all_articles = []
+    for key in website_keys:
+        site_articles = fetch_latest_articles(key, num_per_site)
+        all_articles.extend(site_articles)
+        time.sleep(2)  # Between sites
+    
+    if by_views:
+        all_articles.sort(key=lambda x: len(x.get('title', '')), reverse=True)  # Proxy
+    
+    # Dedupe and limit
+    seen_urls = set()
+    unique = []
+    for art in all_articles[:20]:
+        if art['url'] not in seen_urls:
+            seen_urls.add(art['url'])
+            unique.append(art)
+    
+    return unique
+
+def generate_seo_title(original_title, keywords):
+    """Generate SEO title."""
+    seo_keywords = ' '.join(keywords[:3])
+    if openai_client:
+        prompt = f"Create SEO title <60 chars for: {original_title}. Keywords: {seo_keywords}. Engaging, no clickbait."
+        response = openai_client.chat.completions.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
+        return response.choices[0].message.content.strip()
+    return f"{seo_keywords.capitalize()} Trends 2025 - {original_title[:40]}"
+
+def extract_keywords(text, top_n=10):
+    """Extract keywords."""
+    sentences = sent_tokenize(text)
+    words = [w.lower() for s in sentences for w in nltk.word_tokenize(s) if w.isalnum() and w.lower() not in stop_words]
+    freq = nltk.FreqDist(words)
+    return [w for w, _ in freq.most_common(top_n)]
+
+def rewrite_article(text, min_words=1000):
+    """Rewrite to 1000+ words, original content."""
+    # Summarize
+    max_chunk = 1000
+    chunks = [text[i:i+max_chunk] for i in range(0, len(text), max_chunk)]
+    summaries = []
+    for chunk in chunks:
+        if len(chunk) > 50:
+            summary = summarizer(chunk, max_length=150, min_length=50, do_sample=False)[0]['summary_text']
+            summaries.append(summary)
+    core = ' '.join(summaries)
+    
+    # Expand with T5
+    inputs = tokenizer.encode("Rewrite and expand for SEO: " + core, return_tensors="pt", max_length=512, truncation=True)
+    expanded = expander.generate(inputs, max_length=1500, min_length=min_words//2, num_beams=4, early_stopping=True, do_sample=True, temperature=0.7)
+    rewritten = tokenizer.decode(expanded[0], skip_special_tokens=True)
+    
+    # Ensure length
+    keywords = extract_keywords(rewritten)
+    full = rewritten + f"\n\nKey insights on {', '.join(keywords[:5])} for 2025 trends."
+    while len(full.split()) < min_words:
+        inputs = tokenizer.encode(f"Elaborate: {full[:500]}", return_tensors="pt", max_length=512, truncation=True)
+        extra = expander.generate(inputs, max_length=300, min_length=100, do_sample=True, temperature=0.8)
+        full += " " + tokenizer.decode(extra[0], skip_special_tokens=True)
+    
+    return full[:min_words + 200]
+
+@app.route('/latest_articles', methods=['POST'])
+def latest_articles_endpoint():
+    data = request.json or {}
+    sites = data.get('sites', list(WEBSITES.keys()))
+    num_per_site = data.get('num_per_site', 5)
+    by_views = data.get('by_views', False)
+    
+    articles = fetch_top_viewed_or_latest(sites, num_per_site, by_views)
+    
+    return jsonify({
+        'articles': articles,
+        'total_fetched': len(articles),
+        'sources': [WEBSITES[key]['name'] for key in sites],
+        'fetched_at': datetime.now().isoformat()
+    })
+
+@app.route('/rewrite', methods=['POST'])
+def rewrite_endpoint():
+    data = request.json
+    url = data.get('url')
+    if not url:
+        # Fallback to first latest
+        latest = fetch_latest_articles(list(WEBSITES.keys())[0], 1)
+        if latest:
+            url = latest[0]['url']
         else:
-            # try scraping the site root for recent article(s)
-            seed = fetch_full_article_from_url(src)
-            if not seed:
-                continue
-            article_text = ai_generate_article_from_seed(seed_text=seed, topic=topic)
-            if article_text:
-                generated.append({
-                    "topic": topic,
-                    "generated_article": article_text
-                })
+            return jsonify({'error': 'No URL and fetch failed'}), 400
+    
+    art_data = scrape_article(url)
+    if not art_data or not art_data['text']:
+        return jsonify({'error': 'Scrape failed'}), 404
+    
+    keywords = extract_keywords(art_data['text'])
+    seo_title = generate_seo_title(art_data['title'], keywords)
+    rewritten = rewrite_article(art_data['text'])
+    
+    return jsonify({
+        'seo_title': seo_title,
+        'content': rewritten,
+        'keywords': keywords,
+        'original_url': url,
+        'word_count': len(rewritten.split())
+    })
 
-    # If nothing generated from sources, fallback to generating from topic alone
-    while len(generated) < max_articles:
-        article_text = ai_generate_article_from_seed(seed_text=topic, topic=topic)
-        if not article_text:
-            break
-        generated.append({"topic": topic, "generated_article": article_text})
-
-    if not generated:
-        return jsonify({"error": "Failed to generate article"}), 500
-
-    return jsonify({"results": generated})
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
