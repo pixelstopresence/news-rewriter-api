@@ -7,7 +7,6 @@ app = Flask(__name__)
 
 # List of AI, UX, and Marketing blogs (you can add more)
 BLOG_SOURCES = [
-    "https://blog.hubspot.com/marketing",
     "https://uxdesign.cc/",
     "https://www.marketingaiinstitute.com/blog",
     "https://www.smashingmagazine.com/category/uxdesign/",
@@ -75,4 +74,5 @@ def get_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
