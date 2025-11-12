@@ -2,24 +2,50 @@ services:
   - type: web
     name: news-rewriter-api
     env: python
+    region: singapore  # Closest to India
     buildCommand: |
-      # Step 1: Upgrade pip and tools
-      pip install --upgrade pip setuptools wheel
+      # Debug: Show environment
+      echo "=== Build Start: $(date) ==="
+      python --version
+      pip --version
+      echo "=== Pip upgrade ==="
       
-      # Step 2: Install PyTorch CPU-only from official index
-      pip install torch==2.5.0+cpu torchvision==0.20.0+cpu --index-url https://download.pytorch.org/whl/cpu
+      # Step 1: Upgrade pip and clear cache
+      pip install --upgrade pip setuptools wheel --no-cache-dir
+      pip cache purge
       
-      # Step 3: Install remaining deps from standard PyPI
-      pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+      # Step 2: Install PyTorch CPU-only (separate step)
+      echo "=== Installing PyTorch CPU 2.5.0 ==="
+      pip install torch==2.5.0+cpu --index-url https://download.pytorch.org/whl/cpu --no-cache-dir -v
+      
+      # Step 3: Debug NLTK availability
+      echo "=== Checking NLTK versions ==="
+      pip index versions nltk | head -10
+      
+      # Step 4: Install main requirements
+      echo "=== Installing requirements.txt ==="
+      pip install -r requirements.txt --no-cache-dir -v
+      
+      # Step 5: Verify all imports work
+      echo "=== Testing imports ==="
+      python -c "import flask; print('Flask OK:', flask.__version__)" || echo "Flask failed"
+      python -c "import torch; print('Torch OK:', torch.__version__)" || echo "Torch failed"
+      python -c "import nltk; print('NLTK OK:', nltk.__version__)" || echo "NLTK failed"
+      python -c "from transformers import pipeline; print('Transformers OK')" || echo "Transformers failed"
+      echo "=== Build complete ==="
+    startCommand: gunicorn --workers 1 --bind 0.0.0.0:$PORT app:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: FLASK_ENV
         value: production
-      - key: OPENAI_API_KEY
-        sync: false  # Optional
       - key: PORT
         value: 10000
+      - key: NLTK_DATA
+        value: /tmp/nltk_data
+      - key: PIP_NO_CACHE_DIR
+        value: "1"
+      - key: OPENAI_API_KEY
+        sync: false  # Add your key in Render dashboard if needed
     plan: free
-    region: singapore
+    autoDeploy: true
