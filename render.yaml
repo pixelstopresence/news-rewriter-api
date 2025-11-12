@@ -2,14 +2,18 @@ services:
   - type: web
     name: news-rewriter-api
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
     startCommand: python app.py
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9  # Matches torch/transformers
+        value: 3.11.9  # Stable for torch 2.5.0
       - key: FLASK_ENV
         value: production
-      - key: OPENAI_API_KEY  # Optional: Add your key here for deployment
-        sync: false  # Set in Render dashboard
-    plan: free  # Or upgrade for GPU if needed
-    region: oregon  # Or closest to you (India: singapore)
+      - key: OPENAI_API_KEY  # Optional
+        sync: false
+      - key: TORCH_INDEX_URL  # Reinforce CPU index if needed
+        value: https://download.pytorch.org/whl/cpu
+    plan: free  # Upgrade to Starter for faster builds (~10-15 mins with models)
+    region: singapore  # Low latency for India
