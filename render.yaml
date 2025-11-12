@@ -1,10 +1,15 @@
 services:
   - type: web
-    name: ai-article-generator
+    name: news-rewriter-api
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
     envVars:
-      - key: OPENAI_API_KEY
-        fromDatabase: false
+      - key: PYTHON_VERSION
+        value: 3.11.9  # Matches torch/transformers
+      - key: FLASK_ENV
+        value: production
+      - key: OPENAI_API_KEY  # Optional: Add your key here for deployment
+        sync: false  # Set in Render dashboard
+    plan: free  # Or upgrade for GPU if needed
+    region: oregon  # Or closest to you (India: singapore)
