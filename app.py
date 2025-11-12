@@ -1,39 +1,38 @@
+import os
+import re
+import time
+from datetime import datetime
 from flask import Flask, request, jsonify
+from transformers import pipeline, T5Tokenizer, T5ForConditionalGeneration
+import torch
+
+# Core imports
 import requests
 from bs4 import BeautifulSoup
 from newspaper import Article, ArticleException, build as newspaper_build
-import newspaper  # For source building
-import feedparser  # RSS fallback
-from transformers import pipeline, T5Tokenizer, T5ForConditionalGeneration
-import torch
-import nltk
-from nltk.tokenize import sent_tokenize
-from nltk.corpus import stopwords
-import re
-from openai import OpenAI  # Optional
-import os
-import time
-from datetime import datetime
+import feedparser
+
+# NLTK imports (with safe handling)
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize
+    from nltk.corpus import stopwords
+    NLTK_AVAILABLE = True
+except ImportError:
+    NLTK_AVAILABLE = False
+    print("NLTK not available, using fallback")
 
 app = Flask(__name__)
 
-# Initialize models (load once)
-device = 0 if torch.cuda.is_available() else -1
-summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=device)
-tokenizer = T5Tokenizer.from_pretrained("t5-small")
-expander = T5ForConditionalGeneration.from_pretrained("t5-small")
-nltk.download('punkt', quiet=True)
-nltk.download('stopwords', quiet=True)
-stop_words = set(stopwords.words('english'))
+# Global variables for models (lazy loading)
+summarizer = None
+tokenizer = None
+expander = None
+stop_words = None
 
-# Optional OpenAI
-openai_client = None
-if os.getenv('OPENAI_API_KEY'):
-    openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-
-# Blog-focused websites configuration (add/remove as needed)
+# Blog configuration (UI/UX, Digital Marketing, AI/Tech)
 WEBSITES = {
-    # UI/UX Design
+    # UI/UX Design Blogs
     'ux_collective': {
         'name': 'UX Collective',
         'url': 'https://uxdesign.cc',
@@ -53,7 +52,7 @@ WEBSITES = {
         'config': {'language': 'en', 'max_pages_to_fetch': 5}
     },
     
-    # Digital Marketing
+    # Digital Marketing Blogs
     'hubspot': {
         'name': 'HubSpot Blog',
         'url': 'https://blog.hubspot.com',
@@ -73,7 +72,7 @@ WEBSITES = {
         'config': {'language': 'en', 'max_pages_to_fetch': 5}
     },
     
-    # AI and Technologies
+    # AI and Technologies Blogs
     'marktechpost': {
         'name': 'MarkTechPost',
         'url': 'https://www.marktechpost.com',
@@ -88,184 +87,393 @@ WEBSITES = {
     }
 }
 
+# Initialize AI models (lazy loading for faster startup)
+def load_models():
+    global summarizer, tokenizer, expander
+    if summarizer is None:
+        device = 0 if torch.cuda.is_available() else -1
+        print(f"Loading models on device: {device}")
+        summarizer = pipeline("summarization", 
+                             model="facebook/bart-large-cnn", 
+                             device=device)
+        
+        tokenizer = T5Tokenizer.from_pretrained("t5-small")
+        expander = T5ForConditionalGeneration.from_pretrained("t5-small")
+        print("All models loaded successfully")
+
+# Safe NLTK initialization
+def init_nltk():
+    global stop_words, NLTK_AVAILABLE
+    
+    if NLTK_AVAILABLE:
+        try:
+            # Check if NLTK data exists
+            nltk_path = os.environ.get('NLTK_DATA', '/tmp/nltk_data')
+            if not nltk.data.find('tokenizers/punkt', paths=[nltk_path]):
+                print("Downloading NLTK data...")
+                os.makedirs(nltk_path, exist_ok=True)
+                nltk.download('punkt', download_dir=nltk_path, quiet=False)
+                nltk.download('stopwords', download_dir=nltk_path, quiet=False)
+            
+            stop_words = set(stopwords.words('english'))
+            print(f"NLTK initialized with {len(stop_words)} stopwords")
+            return True
+        except Exception as e:
+            print(f"NLTK setup failed: {e}")
+            NLTK_AVAILABLE = False
+            return False
+    else:
+        # Fallback stopwords
+        stop_words = {
+            'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have', 'i',
+            'it', 'for', 'not', 'on', 'with', 'he', 'as', 'you', 'do', 'at',
+            'this', 'but', 'his', 'by', 'from', 'they', 'she', 'or', 'an', 'will'
+        }
+        print("Using fallback stopwords")
+        return True
+
+# Initialize on startup
+print("Starting News Rewriter API...")
+init_nltk()
+load_models()
+
 def scrape_article(url):
-    """Scrape single article with newspaper3k."""
+    """Scrape single article using newspaper3k."""
     try:
         article = Article(url)
         article.download()
         article.parse()
+        
+        # Validate content
+        if len(article.text) < 100:
+            return None
+            
         return {
-            'title': article.title,
+            'title': article.title or 'Untitled Article',
             'text': article.text,
             'authors': article.authors,
             'publish_date': str(article.publish_date) if article.publish_date else 'Unknown',
-            'url': url
+            'url': url,
+            'word_count': len(article.text.split())
         }
-    except ArticleException:
+    except Exception as e:
+        print(f"Scrape error for {url}: {e}")
         return None
 
-def fetch_rss_fallback(site_url):
-    """Fallback to RSS if scraping fails."""
+def fetch_rss_fallback(site_url, limit=3):
+    """RSS fallback for sites that block scraping."""
     try:
-        feed = feedparser.parse(site_url + '/rss')  # Common RSS path
-        if feed.entries:
-            entry = feed.entries[0]  # Latest
-            return {
-                'title': entry.title,
-                'url': entry.link,
-                'text_preview': (entry.summary or '')[:300],
-                'publish_date': entry.published if 'published' in entry else 'Unknown',
-                'authors': [entry.author] if 'author' in entry else []
-            }
-    except:
-        pass
-    return None
+        # Try common RSS paths
+        for rss_path in ['/rss', '/feed', '/atom.xml', '']:
+            rss_url = f"{site_url.rstrip('/')}{rss_path}"
+            feed = feedparser.parse(rss_url)
+            if feed.entries:
+                articles = []
+                for entry in feed.entries[:limit]:
+                    article = {
+                        'title': entry.title or 'Untitled',
+                        'url': entry.link,
+                        'text_preview': (getattr(entry, 'summary', '') or '')[:300] + '...',
+                        'publish_date': getattr(entry, 'published', 'Unknown'),
+                        'authors': [getattr(entry, 'author', '')] if hasattr(entry, 'author') else [],
+                        'word_count': 100  # Estimate
+                    }
+                    articles.append(article)
+                return articles
+    except Exception as e:
+        print(f"RSS fallback failed for {site_url}: {e}")
+    return []
 
-def fetch_latest_articles(site_key, num_articles=10):
-    """Fetch latest from site with RSS fallback."""
+def fetch_latest_articles(site_key, num_articles=5):
+    """Fetch latest articles from a specific blog."""
     if site_key not in WEBSITES:
         return []
     
     site = WEBSITES[site_key]
+    print(f"Fetching from {site['name']}...")
+    
     articles = []
     
+    # Primary method: Newspaper3k
     try:
-        # Primary: Newspaper3k build
-        source = newspaper_build(site['url'], 
-                                memoize_articles=False,
-                                language=site['config'].get('language', 'en'),
-                                max_pages_to_fetch=site['config'].get('max_pages_to_fetch', 3))
+        source = newspaper_build(
+            site['url'],
+            memoize_articles=False,
+            language=site['config'].get('language', 'en'),
+            max_pages_to_fetch=site['config'].get('max_pages_to_fetch', 3)
+        )
         
-        for article_url in source.article_urls()[:num_articles]:
-            time.sleep(1)  # Rate limit
+        for i, article_url in enumerate(source.article_urls()[:num_articles * 2]):  # Fetch extra for filtering
+            if len(articles) >= num_articles:
+                break
+                
+            time.sleep(1)  # Rate limiting
             art_data = scrape_article(article_url)
-            if art_data and len(art_data['text']) > 200:
+            
+            if art_data and art_data['word_count'] > 200:
                 art_data['source'] = site['name']
                 art_data['category'] = site['category']
+                art_data['text_preview'] = art_data['text'][:300] + '...' if len(art_data['text']) > 300 else art_data['text']
                 articles.append(art_data)
-                if len(articles) >= num_articles:
-                    break
-                    
-    except Exception:
-        # Fallback: RSS
-        fallback = fetch_rss_fallback(site['url'])
-        if fallback:
-            articles.append({**fallback, 'source': site['name'], 'category': site['category']})
+                
+    except Exception as e:
+        print(f"Newspaper3k failed for {site_key}: {e}")
+        # Fallback to RSS
+        rss_articles = fetch_rss_fallback(site['url'], num_articles)
+        for art in rss_articles:
+            art['source'] = site['name']
+            art['category'] = site['category']
+            articles.append(art)
     
-    # Sort by date
-    articles.sort(key=lambda x: x.get('publish_date', ''), reverse=True)
-    return articles
+    # Sort by publish date (most recent first)
+    try:
+        articles.sort(key=lambda x: x.get('publish_date', ''), reverse=True)
+    except:
+        pass  # If dates are malformed, keep original order
+    
+    print(f"Fetched {len(articles)} articles from {site['name']}")
+    return articles[:num_articles]
 
-def fetch_top_viewed_or_latest(website_keys=None, num_per_site=5, by_views=False):
-    """Fetch across sites."""
-    if website_keys is None:
-        website_keys = list(WEBSITES.keys())
+def fetch_top_articles(sites=None, num_per_site=3):
+    """Fetch articles across multiple sites."""
+    if sites is None:
+        sites = list(WEBSITES.keys())
     
     all_articles = []
-    for key in website_keys:
-        site_articles = fetch_latest_articles(key, num_per_site)
+    for site_key in sites:
+        site_articles = fetch_latest_articles(site_key, num_per_site)
         all_articles.extend(site_articles)
-        time.sleep(2)  # Between sites
+        time.sleep(2)  # Rate limit between sites
     
-    if by_views:
-        all_articles.sort(key=lambda x: len(x.get('title', '')), reverse=True)  # Proxy
-    
-    # Dedupe and limit
+    # Deduplicate by URL
     seen_urls = set()
-    unique = []
-    for art in all_articles[:20]:
-        if art['url'] not in seen_urls:
-            seen_urls.add(art['url'])
-            unique.append(art)
+    unique_articles = []
+    for article in all_articles:
+        if article['url'] not in seen_urls:
+            seen_urls.add(article['url'])
+            unique_articles.append(article)
     
-    return unique
-
-def generate_seo_title(original_title, keywords):
-    """Generate SEO title."""
-    seo_keywords = ' '.join(keywords[:3])
-    if openai_client:
-        prompt = f"Create SEO title <60 chars for: {original_title}. Keywords: {seo_keywords}. Engaging, no clickbait."
-        response = openai_client.chat.completions.create(model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}])
-        return response.choices[0].message.content.strip()
-    return f"{seo_keywords.capitalize()} Trends 2025 - {original_title[:40]}"
+    return unique_articles[:15]  # Limit total results
 
 def extract_keywords(text, top_n=10):
-    """Extract keywords."""
-    sentences = sent_tokenize(text)
-    words = [w.lower() for s in sentences for w in nltk.word_tokenize(s) if w.isalnum() and w.lower() not in stop_words]
-    freq = nltk.FreqDist(words)
-    return [w for w, _ in freq.most_common(top_n)]
+    """Extract SEO keywords from text."""
+    if not NLTK_AVAILABLE or stop_words is None:
+        # Simple fallback
+        words = re.findall(r'\b[a-zA-Z]{4,15}\b', text.lower())
+        from collections import Counter
+        common = Counter(words).most_common(top_n)
+        return [word for word, _ in common if len(word) > 3]
+    
+    try:
+        sentences = sent_tokenize(text)
+        words = [
+            word.lower() for sentence in sentences 
+            for word in nltk.word_tokenize(sentence)
+            if word.isalnum() and word.lower() not in stop_words and len(word) > 3
+        ]
+        from nltk import FreqDist
+        freq = FreqDist(words)
+        return [word for word, _ in freq.most_common(top_n)]
+    except Exception:
+        # Fallback
+        return extract_keywords(text, top_n)  # Recursive fallback
+
+def generate_seo_title(original_title, keywords):
+    """Generate SEO-optimized title."""
+    if not keywords:
+        keywords = extract_keywords(original_title)
+    
+    # Simple SEO formula: Keywords + Core + Year
+    seo_keywords = ' '.join(keywords[:4])
+    base_title = re.sub(r'[^\w\s]', '', original_title)[:60]
+    
+    # Create engaging title under 60 characters
+    seo_title = f"{seo_keywords.title()} Guide 2025: {base_title[:40]}"
+    
+    # Trim to 60 chars for SEO
+    return (seo_title[:60] + '...') if len(seo_title) > 60 else seo_title
 
 def rewrite_article(text, min_words=1000):
-    """Rewrite to 1000+ words, original content."""
-    # Summarize
-    max_chunk = 1000
-    chunks = [text[i:i+max_chunk] for i in range(0, len(text), max_chunk)]
-    summaries = []
-    for chunk in chunks:
-        if len(chunk) > 50:
-            summary = summarizer(chunk, max_length=150, min_length=50, do_sample=False)[0]['summary_text']
-            summaries.append(summary)
-    core = ' '.join(summaries)
+    """Rewrite article to human-like, SEO-optimized content."""
+    if len(text) < 100:
+        return "Content too short for rewriting."
     
-    # Expand with T5
-    inputs = tokenizer.encode("Rewrite and expand for SEO: " + core, return_tensors="pt", max_length=512, truncation=True)
-    expanded = expander.generate(inputs, max_length=1500, min_length=min_words//2, num_beams=4, early_stopping=True, do_sample=True, temperature=0.7)
-    rewritten = tokenizer.decode(expanded[0], skip_special_tokens=True)
-    
-    # Ensure length
-    keywords = extract_keywords(rewritten)
-    full = rewritten + f"\n\nKey insights on {', '.join(keywords[:5])} for 2025 trends."
-    while len(full.split()) < min_words:
-        inputs = tokenizer.encode(f"Elaborate: {full[:500]}", return_tensors="pt", max_length=512, truncation=True)
-        extra = expander.generate(inputs, max_length=300, min_length=100, do_sample=True, temperature=0.8)
-        full += " " + tokenizer.decode(extra[0], skip_special_tokens=True)
-    
-    return full[:min_words + 200]
+    try:
+        # Step 1: Summarize to core points
+        max_chunk = 1000
+        chunks = [text[i:i+max_chunk] for i in range(0, len(text), max_chunk)]
+        summaries = []
+        
+        for chunk in chunks:
+            if len(chunk) > 50:
+                summary = summarizer(
+                    chunk, 
+                    max_length=150, 
+                    min_length=50, 
+                    do_sample=False
+                )[0]['summary_text']
+                summaries.append(summary)
+        
+        core_summary = ' '.join(summaries)
+        
+        # Step 2: Expand with T5 model
+        if tokenizer and expander:
+            inputs = tokenizer.encode(
+                f"rewrite and expand for SEO: {core_summary}", 
+                return_tensors="pt", 
+                max_length=512, 
+                truncation=True
+            )
+            
+            with torch.no_grad():
+                expanded = expander.generate(
+                    inputs, 
+                    max_length=1500, 
+                    min_length=min_words//2, 
+                    num_beams=4, 
+                    early_stopping=True, 
+                    do_sample=True, 
+                    temperature=0.7,
+                    pad_token_id=tokenizer.pad_token_id
+                )
+            
+            rewritten = tokenizer.decode(expanded[0], skip_special_tokens=True)
+        else:
+            # Fallback: Simple expansion
+            rewritten = core_summary * 2  # Basic repetition
+        
+        # Step 3: Ensure minimum length and add SEO elements
+        keywords = extract_keywords(rewritten)
+        full_content = rewritten
+        
+        # Add SEO paragraphs
+        full_content += f"\n\nIn 2025, key trends in {', '.join(keywords[:3])} are shaping the industry. "
+        full_content += "This comprehensive guide explores the latest developments and best practices."
+        
+        # Iterative expansion if needed
+        while len(full_content.split()) < min_words:
+            expansion_prompt = f"elaborate on: {full_content[-500:]}"
+            if tokenizer and expander:
+                inputs = tokenizer.encode(expansion_prompt, return_tensors="pt", max_length=512, truncation=True)
+                with torch.no_grad():
+                    extra = expander.generate(inputs, max_length=200, do_sample=True, temperature=0.8)
+                full_content += tokenizer.decode(extra[0], skip_special_tokens=True)
+            else:
+                full_content += " This topic continues to evolve with new insights and applications."
+        
+        return full_content[:min_words + 200].strip()
+        
+    except Exception as e:
+        print(f"Rewrite error: {e}")
+        # Fallback: Simple paraphrasing
+        return f"Comprehensive Analysis of: {text[:300]}...\n\nThis topic explores key aspects of modern digital trends, offering insights for 2025 and beyond."
 
-@app.route('/latest_articles', methods=['POST'])
-def latest_articles_endpoint():
-    data = request.json or {}
-    sites = data.get('sites', list(WEBSITES.keys()))
-    num_per_site = data.get('num_per_site', 5)
-    by_views = data.get('by_views', False)
-    
-    articles = fetch_top_viewed_or_latest(sites, num_per_site, by_views)
-    
+# API Routes
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
     return jsonify({
-        'articles': articles,
-        'total_fetched': len(articles),
-        'sources': [WEBSITES[key]['name'] for key in sites],
-        'fetched_at': datetime.now().isoformat()
+        'status': 'healthy',
+        'nltk_available': NLTK_AVAILABLE,
+        'models_loaded': summarizer is not None,
+        'timestamp': datetime.now().isoformat(),
+        'websites_configured': len(WEBSITES)
     })
 
+@app.route('/latest_articles', methods=['POST'])
+def latest_articles():
+    """Fetch latest articles from blogs."""
+    try:
+        data = request.get_json() or {}
+        sites = data.get('sites', list(WEBSITES.keys()))
+        num_per_site = data.get('num_per_site', 3)
+        category_filter = data.get('category')  # Optional: 'UI/UX', 'Digital Marketing', 'AI/Tech'
+        
+        if category_filter:
+            sites = [k for k, v in WEBSITES.items() if v['category'] == category_filter]
+        
+        articles = fetch_top_articles(sites, num_per_site)
+        
+        return jsonify({
+            'success': True,
+            'articles': articles,
+            'total_articles': len(articles),
+            'sources': list(set([a['source'] for a in articles])),
+            'fetched_at': datetime.now().isoformat(),
+            'config': {
+                'sites_requested': sites,
+                'num_per_site': num_per_site,
+                'category_filter': category_filter
+            }
+        })
+        
+    except Exception as e:
+        print(f"Latest articles error: {e}")
+        return jsonify({'error': 'Failed to fetch articles', 'details': str(e)}), 500
+
 @app.route('/rewrite', methods=['POST'])
-def rewrite_endpoint():
-    data = request.json
-    url = data.get('url')
-    if not url:
-        # Fallback to first latest
-        latest = fetch_latest_articles(list(WEBSITES.keys())[0], 1)
-        if latest:
+def rewrite():
+    """Rewrite a single article."""
+    try:
+        data = request.get_json()
+        url = data.get('url')
+        
+        if not url:
+            # Fallback: Get latest article
+            latest = fetch_latest_articles(list(WEBSITES.keys())[0], 1)
+            if not latest:
+                return jsonify({'error': 'No URL provided and unable to fetch latest article'}), 400
             url = latest[0]['url']
-        else:
-            return jsonify({'error': 'No URL and fetch failed'}), 400
-    
-    art_data = scrape_article(url)
-    if not art_data or not art_data['text']:
-        return jsonify({'error': 'Scrape failed'}), 404
-    
-    keywords = extract_keywords(art_data['text'])
-    seo_title = generate_seo_title(art_data['title'], keywords)
-    rewritten = rewrite_article(art_data['text'])
-    
+        
+        # Scrape article
+        article_data = scrape_article(url)
+        if not article_data or not article_data['text']:
+            return jsonify({'error': 'Failed to scrape or extract content from URL'}), 404
+        
+        # Process and rewrite
+        keywords = extract_keywords(article_data['text'])
+        seo_title = generate_seo_title(article_data['title'], keywords)
+        rewritten_content = rewrite_article(article_data['text'])
+        
+        result = {
+            'success': True,
+            'original': {
+                'title': article_data['title'],
+                'url': article_data['url'],
+                'word_count': article_data['word_count']
+            },
+            'rewritten': {
+                'seo_title': seo_title,
+                'content': rewritten_content,
+                'word_count': len(rewritten_content.split()),
+                'keywords': keywords[:10],
+                'estimated_reading_time': f"{len(rewritten_content.split()) // 200} min"
+            },
+            'processed_at': datetime.now().isoformat()
+        }
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        print(f"Rewrite error: {e}")
+        return jsonify({'error': 'Processing failed', 'details': str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def home():
+    """Simple home endpoint."""
     return jsonify({
-        'seo_title': seo_title,
-        'content': rewritten,
-        'keywords': keywords,
-        'original_url': url,
-        'word_count': len(rewritten.split())
+        'message': 'News Rewriter API - Ready for UI/UX, Digital Marketing, and AI content',
+        'endpoints': {
+            'health': '/health',
+            'latest_articles': '/latest_articles (POST)',
+            'rewrite': '/rewrite (POST)'
+        },
+        'status': 'active'
     })
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # Production: Use gunicorn (handles $PORT)
+    port = int(os.environ.get('PORT', 5000))
+    host = os.environ.get('HOST', '0.0.0.0')
+    app.run(host=host, port=port, debug=False)
