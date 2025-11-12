@@ -1,20 +1,15 @@
-# Core dependencies
-requests>=2.31.0
-beautifulsoup4>=4.12.2
+# Flask web framework
+flask==2.3.3
 
-# lxml - pre-built wheel compatible with Python 3.13
-lxml>=4.10.1
+# OpenAI API client
+openai==1.29.0
 
-# Optional: for async requests / faster scraping
-httpx>=0.26.1
+# RSS feed parsing
+feedparser==6.0.10
 
-# Data handling
-pandas>=2.1.0
-numpy>=1.27.0
+# HTML parsing
+beautifulsoup4==4.12.2
+lxml==4.9.3
 
-# JSON/YAML handling
-pyyaml>=6.0
-
-# Optional: for caching or database
-redis>=5.3.0
-sqlalchemy>=2.0.0
+# HTTP requests
+requests==2.31.0
